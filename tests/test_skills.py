@@ -555,6 +555,7 @@ class TestInjectPlatformInstructionsFiltering:
             "AGENTS.md", "GEMINI.md", ".cursorrules", ".windsurfrules",
             "QODER.md", ".kiro/steering/code-review-graph.md",
             ".github/code-review-graph.instruction.md",
+            "CODEBUDDY.md",
         }
 
     def test_default_is_all(self, tmp_path):
@@ -563,6 +564,7 @@ class TestInjectPlatformInstructionsFiltering:
             "AGENTS.md", "GEMINI.md", ".cursorrules", ".windsurfrules",
             "QODER.md", ".kiro/steering/code-review-graph.md",
             ".github/code-review-graph.instruction.md",
+            "CODEBUDDY.md",
         }
 
     def test_claude_writes_nothing(self, tmp_path):
@@ -609,6 +611,177 @@ class TestInjectPlatformInstructionsFiltering:
         assert not (tmp_path / "GEMINI.md").exists()
         assert not (tmp_path / ".cursorrules").exists()
         assert not (tmp_path / ".windsurfrules").exists()
+
+    def test_codebuddy_writes_only_codebuddy_md(self, tmp_path):
+        updated = inject_platform_instructions(tmp_path, target="codebuddy")
+        assert updated == ["CODEBUDDY.md"]
+        assert (tmp_path / "CODEBUDDY.md").exists()
+        # 不污染其它平台文件
+        assert not (tmp_path / "AGENTS.md").exists()
+        assert not (tmp_path / "GEMINI.md").exists()
+        assert not (tmp_path / "CLAUDE.md").exists()
+
+    def test_codebuddy_instruction_uses_shared_marker(self, tmp_path):
+        inject_platform_instructions(tmp_path, target="codebuddy")
+        content = (tmp_path / "CODEBUDDY.md").read_text()
+        assert _CLAUDE_MD_SECTION_MARKER in content
+        assert "get_minimal_context" in content or "detect_changes" in content
+
+    def test_codebuddy_instruction_idempotent(self, tmp_path):
+        first = inject_platform_instructions(tmp_path, target="codebuddy")
+        second = inject_platform_instructions(tmp_path, target="codebuddy")
+        assert first == ["CODEBUDDY.md"]
+        assert second == []
+        content = (tmp_path / "CODEBUDDY.md").read_text()
+        assert content.count(_CLAUDE_MD_SECTION_MARKER) == 1
+
+
+class TestCodeBuddyPlatformEntry:
+    def test_codebuddy_in_platforms(self):
+        from code_review_graph.skills import PLATFORMS
+        assert "codebuddy" in PLATFORMS
+        plat = PLATFORMS["codebuddy"]
+        assert plat["name"] == "CodeBuddy Code"
+        assert plat["format"] == "object"
+        assert plat["key"] == "mcpServers"
+        assert plat["needs_type"] is True
+        # config_path 是 lambda，需要传 repo_root 验证
+        from pathlib import Path
+        fake_root = Path("/tmp/fake-repo")
+        assert plat["config_path"](fake_root) == fake_root / ".mcp.json"
+
+    def test_codebuddy_in_cli_choices(self):
+        from code_review_graph.cli import _PLATFORM_CHOICES
+        assert "codebuddy" in _PLATFORM_CHOICES
+
+
+class TestInstallCodeBuddySkills:
+    def test_creates_codebuddy_skills_dir(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_skills
+        result = install_codebuddy_skills(tmp_path)
+        assert result == tmp_path / ".codebuddy" / "skills"
+        assert result.is_dir()
+
+    def test_creates_four_skill_subdirs(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_skills
+        skills_dir = install_codebuddy_skills(tmp_path)
+        subdirs = sorted(f.name for f in skills_dir.iterdir() if f.is_dir())
+        assert subdirs == [
+            "debug-issue",
+            "explore-codebase",
+            "refactor-safely",
+            "review-changes",
+        ]
+
+    def test_skill_files_have_frontmatter(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_skills
+        skills_dir = install_codebuddy_skills(tmp_path)
+        for subdir in skills_dir.iterdir():
+            path = subdir / "SKILL.md"
+            assert path.is_file()
+            content = path.read_text()
+            assert content.startswith("---\n")
+            assert "name:" in content
+            assert "description:" in content
+
+    def test_skill_content_references_graph_tools(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_skills
+        skills_dir = install_codebuddy_skills(tmp_path)
+        for subdir in skills_dir.iterdir():
+            content = (subdir / "SKILL.md").read_text()
+            # 每个 skill body 都该提到 graph 工具
+            assert "get_minimal_context" in content or "detect_changes" in content
+
+    def test_install_codebuddy_skills_idempotent(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_skills
+        install_codebuddy_skills(tmp_path)
+        # 第二次调用不应报错
+        install_codebuddy_skills(tmp_path)
+        assert (tmp_path / ".codebuddy" / "skills" / "explore-codebase" / "SKILL.md").is_file()
+
+
+class TestInstallCodeBuddyHooks:
+    def test_creates_codebuddy_settings_with_hooks(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_hooks
+        result = install_codebuddy_hooks(tmp_path)
+        assert result == tmp_path / ".codebuddy" / "settings.json"
+        assert result.is_file()
+        data = json.loads(result.read_text())
+        assert "hooks" in data
+        assert "PostToolUse" in data["hooks"]
+        assert "SessionStart" in data["hooks"]
+
+    def test_hooks_have_correct_matcher(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_hooks
+        install_codebuddy_hooks(tmp_path)
+        data = json.loads((tmp_path / ".codebuddy" / "settings.json").read_text())
+        post_tool = data["hooks"]["PostToolUse"]
+        assert any(entry.get("matcher") == "Edit|Write|Bash" for entry in post_tool)
+
+    def test_preserves_existing_settings_fields(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_hooks
+        settings_dir = tmp_path / ".codebuddy"
+        settings_dir.mkdir(parents=True)
+        settings_path = settings_dir / "settings.json"
+        settings_path.write_text(json.dumps({
+            "model": "hunyuan-pro",
+            "language": "简体中文",
+        }), encoding="utf-8")
+
+        install_codebuddy_hooks(tmp_path)
+
+        data = json.loads(settings_path.read_text())
+        assert data["model"] == "hunyuan-pro"
+        assert data["language"] == "简体中文"
+        assert "hooks" in data
+
+    def test_merges_with_existing_user_hooks(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_hooks
+        settings_dir = tmp_path / ".codebuddy"
+        settings_dir.mkdir(parents=True)
+        settings_path = settings_dir / "settings.json"
+        user_hook = {
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "matcher": "Edit",
+                        "hooks": [{"type": "command", "command": "echo user-hook", "timeout": 5}],
+                    }
+                ]
+            }
+        }
+        settings_path.write_text(json.dumps(user_hook), encoding="utf-8")
+
+        install_codebuddy_hooks(tmp_path)
+
+        data = json.loads(settings_path.read_text())
+        post_tool = data["hooks"]["PostToolUse"]
+        # 用户原 hook 仍在
+        assert len(post_tool) == 2
+        commands = [h["command"] for entry in post_tool for h in entry.get("hooks", [])]
+        assert "echo user-hook" in commands
+
+    def test_creates_backup_when_existing_settings(self, tmp_path):
+        from code_review_graph.skills import install_codebuddy_hooks
+        settings_dir = tmp_path / ".codebuddy"
+        settings_dir.mkdir(parents=True)
+        settings_path = settings_dir / "settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+
+        install_codebuddy_hooks(tmp_path)
+
+        assert (settings_dir / "settings.json.bak").is_file()
+
+    def test_claude_install_hooks_still_works_after_refactor(self, tmp_path):
+        """Regression: install_hooks (Claude) must keep working after
+        _merge_hooks_into_settings extraction."""
+        from code_review_graph.skills import install_hooks
+        install_hooks(tmp_path, platform="claude")
+        claude_settings = tmp_path / ".claude" / "settings.json"
+        assert claude_settings.is_file()
+        data = json.loads(claude_settings.read_text())
+        assert "hooks" in data
+        assert "PostToolUse" in data["hooks"]
 
 
 class TestInstallPlatformConfigs:
@@ -923,6 +1096,53 @@ class TestInstallPlatformConfigs:
         assert data["mcpServers"]["code-review-graph"]["type"] == "stdio"
         expected_cmd, _ = _detect_serve_command()
         assert data["mcpServers"]["code-review-graph"]["command"] == expected_cmd
+
+    def test_install_all_dedupes_shared_mcp_json(self, tmp_path):
+        """When two platforms share the same config_path (e.g., claude and
+        codebuddy both use <repo>/.mcp.json), the file must be written once
+        and both platform names appear in `configured`."""
+        # Force both claude and codebuddy to be detected
+        with patch.dict(
+            PLATFORMS,
+            {
+                "claude": {**PLATFORMS["claude"], "detect": lambda: True},
+                "codebuddy": {**PLATFORMS["codebuddy"], "detect": lambda: True},
+            },
+        ):
+            configured = install_platform_configs(tmp_path, target="all")
+
+        # Both platforms reported as configured
+        assert "Claude Code" in configured
+        assert "CodeBuddy Code" in configured
+
+        # But .mcp.json was written exactly once (single server entry)
+        mcp_path = tmp_path / ".mcp.json"
+        assert mcp_path.exists()
+        data = json.loads(mcp_path.read_text())
+        assert "code-review-graph" in data["mcpServers"]
+        # The server entry appears only once — no duplicate writes
+        mcp_text = mcp_path.read_text()
+        # Count server-key occurrences (the "code-review-graph": entry under
+        # mcpServers), not the literal string elsewhere (e.g., args list).
+        # Before dedup, the second pass would append a second mcpServers key.
+        # After dedup, the dict-merge path guarantees exactly one entry.
+        assert mcp_text.count('"code-review-graph":') == 1
+
+    def test_install_all_dedupes_logs_single_write(self, tmp_path, capsys):
+        """Deduplicated platforms should not produce duplicate 'configured'
+        log lines."""
+        with patch.dict(
+            PLATFORMS,
+            {
+                "claude": {**PLATFORMS["claude"], "detect": lambda: True},
+                "codebuddy": {**PLATFORMS["codebuddy"], "detect": lambda: True},
+            },
+        ):
+            install_platform_configs(tmp_path, target="all")
+        out = capsys.readouterr().out
+        # .mcp.json path should appear exactly once in the output
+        mcp_path_str = str(tmp_path / ".mcp.json")
+        assert out.count(mcp_path_str) == 1
 
 
 class TestGeminiCLIInstall:

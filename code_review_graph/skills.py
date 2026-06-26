@@ -146,6 +146,14 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "format": "object",
         "needs_type": True,
     },
+    "codebuddy": {
+        "name": "CodeBuddy Code",
+        "config_path": lambda root: root / ".mcp.json",
+        "key": "mcpServers",
+        "detect": lambda: True,
+        "format": "object",
+        "needs_type": True,
+    },
 }
 
 
@@ -310,11 +318,28 @@ def install_platform_configs(
         # Workspace-level Kiro detection
         if "kiro" not in platforms_to_install and (repo_root / ".kiro").is_dir():
             platforms_to_install["kiro"] = PLATFORMS["kiro"]
+        # Deduplicate platforms that share the same config_path (e.g.,
+        # claude and codebuddy both target <repo>/.mcp.json). The first
+        # platform wins and represents the file in the write loop; all
+        # sharing platforms are credited in `configured`.
+        seen_paths: dict[Path, list[str]] = {}
+        deduped: dict[str, dict[str, Any]] = {}
+        for k, v in platforms_to_install.items():
+            cp = v["config_path"](repo_root)
+            if cp in seen_paths:
+                seen_paths[cp].append(k)
+                continue
+            seen_paths[cp] = [k]
+            deduped[k] = v
+        platforms_to_install = deduped
     else:
         if target not in PLATFORMS:
             logger.error("Unknown platform: %s", target)
             return []
         platforms_to_install = {target: PLATFORMS[target]}
+        # For single-platform installs, seen_paths maps the file to the
+        # singleton platform list — uniform with the all-branch.
+        seen_paths = {PLATFORMS[target]["config_path"](repo_root): [target]}
 
     configured: list[str] = []
 
@@ -332,13 +357,19 @@ def install_platform_configs(
             )
             if not changed:
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                # Credit all platforms that share this config_path
+                written_path = config_path
+                for name_key in seen_paths.get(written_path, [key]):
+                    configured.append(PLATFORMS[name_key]["name"])
                 continue
             if dry_run:
                 print(f"  [dry-run] {plat['name']}: would write {config_path}")
             else:
                 print(f"  {plat['name']}: configured {config_path}")
-            configured.append(plat["name"])
+            # Credit all platforms that share this config_path
+            written_path = config_path
+            for name_key in seen_paths.get(written_path, [key]):
+                configured.append(PLATFORMS[name_key]["name"])
             continue
 
         # Read existing config
@@ -364,7 +395,10 @@ def install_platform_configs(
             # Check if already present
             if any(isinstance(s, dict) and s.get("name") == "code-review-graph" for s in arr):
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                # Credit all platforms that share this config_path
+                written_path = config_path
+                for name_key in seen_paths.get(written_path, [key]):
+                    configured.append(PLATFORMS[name_key]["name"])
                 continue
             arr_entry = {"name": "code-review-graph", **server_entry}
             arr.append(arr_entry)
@@ -375,7 +409,10 @@ def install_platform_configs(
                 servers = {}
             if "code-review-graph" in servers:
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                # Credit all platforms that share this config_path
+                written_path = config_path
+                for name_key in seen_paths.get(written_path, [key]):
+                    configured.append(PLATFORMS[name_key]["name"])
                 continue
             servers["code-review-graph"] = server_entry
             existing[server_key] = servers
@@ -387,7 +424,10 @@ def install_platform_configs(
             config_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
             print(f"  {plat['name']}: configured {config_path}")
 
-        configured.append(plat["name"])
+        # Credit all platforms that share this config_path
+        written_path = config_path
+        for name_key in seen_paths.get(written_path, [key]):
+            configured.append(PLATFORMS[name_key]["name"])
 
     return configured
 
@@ -707,42 +747,41 @@ fi
     return hook_path
 
 
-def install_hooks(repo_root: Path, platform: str = "claude") -> None:
-    """Write hooks config to platform-specific settings.json.
+def _merge_hooks_into_settings(
+    settings_dir: Path,
+    settings_filename: str,
+    new_hooks: dict[str, Any],
+) -> Path:
+    """Merge a hooks config dict into ``<settings_dir>/<settings_filename>``.
 
-    Merges new hook entries into existing settings, preserving both
-    non-hook configuration and user-defined hooks.  A backup of the
-    original file is created before any modifications.
+    Shared by Claude (``.claude/settings.json``), Qoder
+    (``.qoder/settings.json``), and CodeBuddy (``.codebuddy/settings.json``)
+    — all three use the same hooks schema.
 
-    Args:
-        repo_root: Repository root directory.
-        platform: Target platform ("claude" or "qoder").
+    - Preserves existing settings (non-hooks top-level fields)
+    - Creates a ``<filename>.bak`` backup before modification
+    - Merges hook arrays by entry equality dedup
     """
-    if platform == "qoder":
-        settings_dir = repo_root / ".qoder"
-    else:
-        settings_dir = repo_root / ".claude"
     settings_dir.mkdir(parents=True, exist_ok=True)
-    settings_path = settings_dir / "settings.json"
+    settings_path = settings_dir / settings_filename
 
     existing: dict[str, Any] = {}
     if settings_path.exists():
         try:
             existing = json.loads(settings_path.read_text(encoding="utf-8", errors="replace"))
-            backup_path = settings_dir / "settings.json.bak"
+            backup_path = settings_dir / f"{settings_filename}.bak"
             shutil.copy2(settings_path, backup_path)
             logger.info("Backed up existing settings to %s", backup_path)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not read existing %s: %s", settings_path, exc)
 
-    hooks_config = generate_hooks_config(repo_root)
     existing_hooks = existing.get("hooks", {})
     if not isinstance(existing_hooks, dict):
         logger.warning("Existing hooks config is not a dict; replacing with defaults")
         existing_hooks = {}
 
     merged_hooks = dict(existing_hooks)
-    for hook_name, hook_entries in hooks_config.get("hooks", {}).items():
+    for hook_name, hook_entries in new_hooks.items():
         if isinstance(merged_hooks.get(hook_name), list):
             merged_list = list(merged_hooks[hook_name])
             for entry in hook_entries:
@@ -756,6 +795,40 @@ def install_hooks(repo_root: Path, platform: str = "claude") -> None:
 
     settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
     logger.info("Wrote hooks config: %s", settings_path)
+    return settings_path
+
+
+def install_hooks(repo_root: Path, platform: str = "claude") -> None:
+    """Write hooks config to platform-specific settings.json.
+
+    Merges new hook entries into existing settings, preserving both
+    non-hook configuration and user-defined hooks.
+
+    Args:
+        repo_root: Repository root directory.
+        platform: Target platform (``"claude"`` or ``"qoder"``).
+    """
+    if platform == "qoder":
+        settings_dir = repo_root / ".qoder"
+    else:
+        settings_dir = repo_root / ".claude"
+    hooks_config = generate_hooks_config(repo_root)
+    _merge_hooks_into_settings(settings_dir, "settings.json", hooks_config["hooks"])
+
+
+def install_codebuddy_hooks(repo_root: Path) -> Path:
+    """Write hooks config to project-level ``.codebuddy/settings.json``.
+
+    Schema is identical to Claude Code settings.json hooks, so we reuse
+    ``generate_hooks_config()`` and the shared merge helper.
+
+    Returns:
+        Path to the settings.json file that was written.
+    """
+    hooks_config = generate_hooks_config(repo_root)
+    return _merge_hooks_into_settings(
+        repo_root / ".codebuddy", "settings.json", hooks_config["hooks"],
+    )
 
 
 def install_codex_hooks(repo_root: Path) -> Path:
@@ -957,6 +1030,7 @@ _PLATFORM_INSTRUCTION_FILES: dict[str, tuple[str, ...]] = {
     "QODER.md": ("qoder",),
     ".kiro/steering/code-review-graph.md": ("kiro",),
     ".github/code-review-graph.instruction.md": ("copilot", "copilot-cli"),
+    "CODEBUDDY.md": ("codebuddy",),
 }
 
 
@@ -1374,6 +1448,35 @@ def install_qoder_skills(repo_root: Path) -> Path | None:
         logger.info("Installed %d skill(s) to %s", installed_count, qoder_skills_dir)
         return qoder_skills_dir
     return None
+
+
+def install_codebuddy_skills(repo_root: Path) -> Path:
+    """Install CodeBuddy Code skills at .codebuddy/skills/<slug>/SKILL.md.
+
+    CodeBuddy Code CLI discovers project-level skills from
+    ``.codebuddy/skills/<slug>/SKILL.md``. The SKILL.md format (YAML
+    frontmatter + Markdown body) is identical to Gemini CLI and Qoder.
+    Reuses the shared ``_SKILLS`` dictionary for body content.
+    """
+    skills_root = repo_root / ".codebuddy" / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+
+    for filename, skill in _SKILLS.items():
+        slug = filename.rsplit(".", 1)[0]
+        skill_dir = skills_root / slug
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_path = skill_dir / "SKILL.md"
+        content = (
+            "---\n"
+            f"name: {slug}\n"
+            f"description: {skill['description']}\n"
+            "---\n\n"
+            f"{skill['body']}\n"
+        )
+        skill_path.write_text(content, encoding="utf-8")
+        logger.info("Wrote CodeBuddy skill: %s", skill_path)
+
+    return skills_root
 
 
 # --- OpenCode plugin ---
